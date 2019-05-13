@@ -30,12 +30,18 @@ import android.hardware.usb.UsbRequest;
 import android.os.Build;
 import android.util.Log;
 
+import com.hoho.android.usbserial.util.HexDump;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * USB CDC/ACM serial driver implementation.
@@ -68,8 +74,6 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
     }
 
     class CdcAcmSerialPort extends CommonUsbSerialPort {
-
-        private final boolean mEnableAsyncReads;
         private UsbInterface mControlInterface;
         private UsbInterface mDataInterface;
 
@@ -88,9 +92,11 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
         private static final int SET_CONTROL_LINE_STATE = 0x22;
         private static final int SEND_BREAK = 0x23;
 
+        private final BlockingQueue<ByteBuffer> mReadQueue;
+
         public CdcAcmSerialPort(UsbDevice device, int portNumber) {
             super(device, portNumber);
-            mEnableAsyncReads = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1);
+            mReadQueue = new LinkedBlockingQueue<>();
         }
 
         @Override
@@ -109,19 +115,12 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
             try {
 
                 if (1 == mDevice.getInterfaceCount()) {
-                    Log.d(TAG,"device might be castrated ACM device, trying single interface logic");
+                    Log.d(TAG, "device might be castrated ACM device, trying single interface logic");
                     openSingleInterface();
                 } else {
-                    Log.d(TAG,"trying default interface logic");
+                    Log.d(TAG, "trying default interface logic");
                     openInterface();
                 }
-
-                if (mEnableAsyncReads) {
-                    Log.d(TAG, "Async reads enabled");
-                } else {
-                    Log.d(TAG, "Async reads disabled.");
-                }
-
 
                 opened = true;
             } finally {
@@ -152,7 +151,7 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
             int endCount = mControlInterface.getEndpointCount();
 
             if (endCount < 3) {
-                Log.d(TAG,"not enough endpoints - need 3. count=" + mControlInterface.getEndpointCount());
+                Log.d(TAG, "not enough endpoints - need 3. count=" + mControlInterface.getEndpointCount());
                 throw new IOException("Insufficient number of endpoints(" + mControlInterface.getEndpointCount() + ")");
             }
 
@@ -163,24 +162,24 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
             for (int i = 0; i < endCount; ++i) {
                 UsbEndpoint ep = mControlInterface.getEndpoint(i);
                 if ((ep.getDirection() == UsbConstants.USB_DIR_IN) &&
-                    (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_INT)) {
-                    Log.d(TAG,"Found controlling endpoint");
+                        (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_INT)) {
+                    Log.d(TAG, "Found controlling endpoint");
                     mControlEndpoint = ep;
                 } else if ((ep.getDirection() == UsbConstants.USB_DIR_IN) &&
-                           (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK)) {
-                    Log.d(TAG,"Found reading endpoint");
+                        (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK)) {
+                    Log.d(TAG, "Found reading endpoint");
                     mReadEndpoint = ep;
                 } else if ((ep.getDirection() == UsbConstants.USB_DIR_OUT) &&
                         (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK)) {
-                    Log.d(TAG,"Found writing endpoint");
+                    Log.d(TAG, "Found writing endpoint");
                     mWriteEndpoint = ep;
                 }
 
 
                 if ((mControlEndpoint != null) &&
-                    (mReadEndpoint != null) &&
-                    (mWriteEndpoint != null)) {
-                    Log.d(TAG,"Found all required endpoints");
+                        (mReadEndpoint != null) &&
+                        (mWriteEndpoint != null)) {
+                    Log.d(TAG, "Found all required endpoints");
                     break;
                 }
             }
@@ -188,7 +187,7 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
             if ((mControlEndpoint == null) ||
                     (mReadEndpoint == null) ||
                     (mWriteEndpoint == null)) {
-                Log.d(TAG,"Could not establish all endpoints");
+                Log.d(TAG, "Could not establish all endpoints");
                 throw new IOException("Could not establish all endpoints");
             }
         }
@@ -215,10 +214,54 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
             if (!mConnection.claimInterface(mDataInterface, true)) {
                 throw new IOException("Could not claim data interface.");
             }
+
+            final Map<UsbEndpoint, ByteBuffer> bufferForEndpoints =
+                    new HashMap<UsbEndpoint, ByteBuffer>();
+
             mReadEndpoint = mDataInterface.getEndpoint(1);
             Log.d(TAG, "Read endpoint direction: " + mReadEndpoint.getDirection());
+            {
+                ByteBuffer buffer = ByteBuffer.allocate(mReadEndpoint.getMaxPacketSize());
+                UsbRequest request = new UsbRequest();
+                request.initialize(mConnection, mReadEndpoint);
+                request.queue(buffer, buffer.remaining());
+
+                bufferForEndpoints.put(mReadEndpoint, buffer);
+            }
+
             mWriteEndpoint = mDataInterface.getEndpoint(0);
             Log.d(TAG, "Write endpoint direction: " + mWriteEndpoint.getDirection());
+
+            new Thread() {
+                @Override
+                public void run() {
+                    while (true) {
+                        if (mConnection == null) {
+                            break;
+                        }
+                        UsbRequest request = mConnection.requestWait();
+                        if (request == null) {
+                            Log.d(TAG, "device is closed requestWait fail.");
+                            break;
+                        }
+                        UsbEndpoint endpoint = request.getEndpoint();
+                        if (endpoint.getDirection() != UsbConstants.USB_DIR_IN) {
+                            continue;
+                        }
+                        ByteBuffer buffer = bufferForEndpoints.get(endpoint);
+                        int pos = buffer.position();
+                        if (pos > 0) {
+                            buffer.rewind();
+                            // read bytes
+                            final byte[] bs = new byte[pos];
+                            buffer.get(bs, 0, bs.length);
+                            mReadQueue.add(ByteBuffer.wrap(bs));
+                        }
+                        buffer.rewind();
+                        request.queue(buffer, buffer.capacity());
+                    }
+                }
+            }.start();
         }
 
         private int sendAcmControlMessage(int request, int value, byte[] buf) {
@@ -237,51 +280,32 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
 
         @Override
         public int read(byte[] dest, int timeoutMillis) throws IOException {
-            if (mEnableAsyncReads) {
-              final UsbRequest request = new UsbRequest();
-              try {
-                request.initialize(mConnection, mReadEndpoint);
-                final ByteBuffer buf = ByteBuffer.wrap(dest);
-                if (!request.queue(buf, dest.length)) {
-                  throw new IOException("Error queueing request.");
+            final int interval = 50;
+            int readBytes = 0;
+            int elapsed = 0;
+            while (true) {
+                ByteBuffer buf = mReadQueue.peek();
+                if (buf == null) {
+                    try {
+                        Thread.sleep(interval);
+                        elapsed += interval;
+                        if (elapsed > timeoutMillis) {
+                            return readBytes;
+                        }
+                    } catch (InterruptedException e) {}
+                    continue;
                 }
-
-                final UsbRequest response = mConnection.requestWait();
-                if (response == null) {
-                  throw new IOException("Null response");
+                if (!buf.hasRemaining()) {
+                    try {
+                        mReadQueue.take();
+                    } catch (InterruptedException e) {}
+                    continue;
                 }
-
-                final int nread = buf.position();
-                if (nread > 0) {
-                  //Log.d(TAG, HexDump.dumpHexString(dest, 0, Math.min(32, dest.length)));
-                  return nread;
-                } else {
-                  return 0;
-                }
-              } finally {
-                request.close();
-              }
+                int r = Math.min(buf.remaining(), dest.length);
+                buf.get(dest, 0, r);
+                readBytes += r;
+                return readBytes;
             }
-
-            final int numBytesRead;
-            synchronized (mReadBufferLock) {
-                int readAmt = Math.min(dest.length, mReadBuffer.length);
-                numBytesRead = mConnection.bulkTransfer(mReadEndpoint, mReadBuffer, readAmt,
-                        timeoutMillis);
-                if (numBytesRead < 0) {
-                    // This sucks: we get -1 on timeout, not 0 as preferred.
-                    // We *should* use UsbRequest, except it has a bug/api oversight
-                    // where there is no way to determine the number of bytes read
-                    // in response :\ -- http://b.android.com/28023
-                    if (timeoutMillis == Integer.MAX_VALUE) {
-                        // Hack: Special case "~infinite timeout" as an error.
-                        return -1;
-                    }
-                    return 0;
-                }
-                System.arraycopy(mReadBuffer, 0, dest, 0, numBytesRead);
-            }
-            return numBytesRead;
         }
 
         @Override
@@ -323,25 +347,43 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
         public void setParameters(int baudRate, int dataBits, int stopBits, int parity) {
             byte stopBitsByte;
             switch (stopBits) {
-                case STOPBITS_1: stopBitsByte = 0; break;
-                case STOPBITS_1_5: stopBitsByte = 1; break;
-                case STOPBITS_2: stopBitsByte = 2; break;
-                default: throw new IllegalArgumentException("Bad value for stopBits: " + stopBits);
+                case STOPBITS_1:
+                    stopBitsByte = 0;
+                    break;
+                case STOPBITS_1_5:
+                    stopBitsByte = 1;
+                    break;
+                case STOPBITS_2:
+                    stopBitsByte = 2;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Bad value for stopBits: " + stopBits);
             }
 
             byte parityBitesByte;
             switch (parity) {
-                case PARITY_NONE: parityBitesByte = 0; break;
-                case PARITY_ODD: parityBitesByte = 1; break;
-                case PARITY_EVEN: parityBitesByte = 2; break;
-                case PARITY_MARK: parityBitesByte = 3; break;
-                case PARITY_SPACE: parityBitesByte = 4; break;
-                default: throw new IllegalArgumentException("Bad value for parity: " + parity);
+                case PARITY_NONE:
+                    parityBitesByte = 0;
+                    break;
+                case PARITY_ODD:
+                    parityBitesByte = 1;
+                    break;
+                case PARITY_EVEN:
+                    parityBitesByte = 2;
+                    break;
+                case PARITY_MARK:
+                    parityBitesByte = 3;
+                    break;
+                case PARITY_SPACE:
+                    parityBitesByte = 4;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Bad value for parity: " + parity);
             }
 
             byte[] msg = {
-                    (byte) ( baudRate & 0xff),
-                    (byte) ((baudRate >> 8 ) & 0xff),
+                    (byte) (baudRate & 0xff),
+                    (byte) ((baudRate >> 8) & 0xff),
                     (byte) ((baudRate >> 16) & 0xff),
                     (byte) ((baudRate >> 24) & 0xff),
                     stopBitsByte,
@@ -402,7 +444,7 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
     public static Map<Integer, int[]> getSupportedDevices() {
         final Map<Integer, int[]> supportedDevices = new LinkedHashMap<Integer, int[]>();
         supportedDevices.put(Integer.valueOf(UsbId.VENDOR_ARDUINO),
-                new int[] {
+                new int[]{
                         UsbId.ARDUINO_UNO,
                         UsbId.ARDUINO_UNO_R3,
                         UsbId.ARDUINO_MEGA_2560,
@@ -413,18 +455,19 @@ public class CdcAcmSerialDriver implements UsbSerialDriver {
                         UsbId.ARDUINO_MEGA_ADK_R3,
                         UsbId.ARDUINO_LEONARDO,
                         UsbId.ARDUINO_MICRO,
+                        UsbId.LEONARD_PRO_MICRO,
                 });
         supportedDevices.put(Integer.valueOf(UsbId.VENDOR_VAN_OOIJEN_TECH),
-                new int[] {
-                    UsbId.VAN_OOIJEN_TECH_TEENSYDUINO_SERIAL,
+                new int[]{
+                        UsbId.VAN_OOIJEN_TECH_TEENSYDUINO_SERIAL,
                 });
         supportedDevices.put(Integer.valueOf(UsbId.VENDOR_ATMEL),
-                new int[] {
-                    UsbId.ATMEL_LUFA_CDC_DEMO_APP,
+                new int[]{
+                        UsbId.ATMEL_LUFA_CDC_DEMO_APP,
                 });
         supportedDevices.put(Integer.valueOf(UsbId.VENDOR_LEAFLABS),
-                new int[] {
-                    UsbId.LEAFLABS_MAPLE,
+                new int[]{
+                        UsbId.LEAFLABS_MAPLE,
                 });
         return supportedDevices;
     }
